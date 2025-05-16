@@ -9,6 +9,7 @@ import gdown
 import logging
 import h5py
 import requests
+import gc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +32,13 @@ MODEL_URLS = {
 # Minimum expected file size for models (in MB)
 MIN_MODEL_SIZE_MB = 10
 
+# Mapping of model types to model files
+MODEL_FILES = {
+    'eye': 'Vgg16(2).h5',
+    'chest': 'chest_xray_model.h5',
+    'brain': 'Brain_tumor_best_model.h5'
+}
+
 # Validate if a file is a valid HDF5 file
 def is_valid_hdf5(file_path):
     try:
@@ -49,67 +57,45 @@ def is_url_accessible(url):
         logger.error(f"Failed to access URL {url}: {str(e)}")
         return False
 
-# Download models if they don’t exist locally or are invalid
-def download_models():
-    for model_name, url in MODEL_URLS.items():
-        model_path = os.path.join(MODEL_DIR, model_name)
-        # Check if file exists and is valid; if not, delete and re-download
-        if os.path.exists(model_path):
-            if not is_valid_hdf5(model_path):
-                logger.info(f"Removing invalid file {model_name}")
+# Download a model if it doesn’t exist locally or is invalid
+def download_model(model_name):
+    model_path = os.path.join(MODEL_DIR, model_name)
+    # Check if file exists and is valid; if not, delete and re-download
+    if os.path.exists(model_path):
+        if not is_valid_hdf5(model_path):
+            logger.info(f"Removing invalid file {model_name}")
+            os.remove(model_path)
+        else:
+            file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
+            if file_size < MIN_MODEL_SIZE_MB:
+                logger.info(f"Removing small file {model_name} ({file_size:.2f} MB)")
                 os.remove(model_path)
-            else:
-                file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
-                if file_size < MIN_MODEL_SIZE_MB:
-                    logger.info(f"Removing small file {model_name} ({file_size:.2f} MB)")
-                    os.remove(model_path)
-        
-        if not os.path.exists(model_path):
-            if not is_url_accessible(url):
-                logger.error(f"Google Drive URL for {model_name} is not accessible")
-                continue
-            logger.info(f"Downloading {model_name} from {url}...")
-            try:
-                gdown.download(url, model_path, quiet=False, fuzzy=True)
-                file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
-                logger.info(f"Successfully downloaded {model_name} (Size: {file_size:.2f} MB)")
-                if file_size < MIN_MODEL_SIZE_MB:
-                    logger.error(f"Downloaded file {model_name} is too small ({file_size:.2f} MB)")
-                    os.remove(model_path)
-                    continue
-                if not is_valid_hdf5(model_path):
-                    logger.error(f"Downloaded file {model_name} is not a valid HDF5 file")
-                    os.remove(model_path)
-                    continue
-            except Exception as e:
-                logger.error(f"Failed to download {model_name}: {str(e)}")
-                continue
-
-# Load models after downloading
-models = {}
-try:
-    download_models()
-    for model_type, model_name in [('eye', 'Vgg16(2).h5'), 
-                                 ('chest', 'chest_xray_model.h5'), 
-                                 ('brain', 'Brain_tumor_best_model.h5')]:
-        model_path = os.path.join(MODEL_DIR, model_name)
-        if not os.path.exists(model_path):
-            logger.warning(f"Model file {model_name} not found for {model_type}")
-            continue
+    
+    if not os.path.exists(model_path):
+        url = MODEL_URLS.get(model_name)
+        if not url:
+            logger.error(f"No URL found for {model_name}")
+            raise ValueError(f"No URL found for {model_name}")
+        if not is_url_accessible(url):
+            logger.error(f"Google Drive URL for {model_name} is not accessible")
+            raise ValueError(f"Google Drive URL for {model_name} is not accessible")
+        logger.info(f"Downloading {model_name} from {url}...")
         try:
-            models[model_type] = load_model(model_path)
-            logger.info(f"Successfully loaded {model_type} model")
+            gdown.download(url, model_path, quiet=False, fuzzy=True)
+            file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
+            logger.info(f"Successfully downloaded {model_name} (Size: {file_size:.2f} MB)")
+            if file_size < MIN_MODEL_SIZE_MB:
+                logger.error(f"Downloaded file {model_name} is too small ({file_size:.2f} MB)")
+                os.remove(model_path)
+                raise ValueError(f"Downloaded file {model_name} is too small")
+            if not is_valid_hdf5(model_path):
+                logger.error(f"Downloaded file {model_name} is not a valid HDF5 file")
+                os.remove(model_path)
+                raise ValueError(f"Downloaded file {model_name} is not a valid HDF5 file")
         except Exception as e:
-            logger.error(f"Failed to load {model_type} model: {str(e)}")
-            continue
-    if not models:
-        logger.error("No models were loaded successfully")
-        raise ValueError("No models were loaded successfully")
-    logger.info("Loaded models: %s", list(models.keys()))
-except Exception as e:
-    logger.error("Error during model loading process: %s", str(e))
-    if not models:
-        raise
+            logger.error(f"Failed to download {model_name}: {str(e)}")
+            raise
+    return model_path
 
 labels = {
     'eye': ['Age-Related Macular Degeneration', 'Branch Retinal Vein Occlusion',
@@ -145,8 +131,8 @@ def predict():
     image_file = request.files['image']
     model_type = request.form['model']
 
-    if model_type not in models:
-        return jsonify({'error': f'Invalid model type. Available models: {list(models.keys())}'}), 400
+    if model_type not in MODEL_FILES:
+        return jsonify({'error': f'Invalid model type. Available models: {list(MODEL_FILES.keys())}'}), 400
 
     image_path = "temp.jpg"
     try:
@@ -157,15 +143,28 @@ def predict():
         return jsonify({'error': f'Failed to save image: {str(e)}'}), 500
 
     try:
+        # Download and load the model on-demand
+        model_name = MODEL_FILES[model_type]
+        model_path = download_model(model_name)
+        logger.info("Loading model %s for %s...", model_name, model_type)
+        model = load_model(model_path)
+
+        # Preprocess image and predict
         img = preprocess_image(image_path, model_type)
-        prediction = models[model_type].predict(img)
+        prediction = model.predict(img)
         logger.info("Raw prediction for %s: %s", model_type, prediction)
 
         predicted_index = np.argmax(prediction)
         predicted_label = labels[model_type][predicted_index]
 
+        # Clean up
         os.remove(image_path)
         logger.info("Temporary image removed for %s", model_type)
+
+        # Free up memory
+        del model
+        gc.collect()
+        tf.keras.backend.clear_session()  # Clear TensorFlow session to free memory
         
         return jsonify({'prediction': predicted_label})
     except Exception as e:
