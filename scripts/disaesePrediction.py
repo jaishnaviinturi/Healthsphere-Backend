@@ -112,6 +112,11 @@ image_sizes = {
     'brain': (150, 150)
 }
 
+@app.route('/', methods=['GET'])
+def health_check():
+    """Simple health check endpoint."""
+    return jsonify({'status': 'OK', 'message': 'HealthSphere Backend is running', 'available_models': list(MODEL_FILES.keys())})
+
 def preprocess_image(image_path, model_type):
     """Loads and preprocesses image for model prediction."""
     try:
@@ -174,4 +179,5 @@ def predict():
         return jsonify({'error': f'Prediction failed for {model_type}: {str(e)}'}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5005)
+    port = int(os.getenv("PORT", 5005))
+    app.run(debug=False, host='0.0.0.0', port=port)
