@@ -1,15 +1,18 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Disable GPU usage
 import numpy as np
 import tensorflow as tf
+import tensorflow.lite as tflite
 from flask import Flask, request, jsonify
-from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.models import load_model
 from flask_cors import CORS
 import gdown
 import logging
-import h5py
 import requests
 import gc
+import psutil
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -25,28 +28,29 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 # Dictionary of model names and their Google Drive direct download links
 MODEL_URLS = {
     "Brain_tumor_best_model.h5": "https://drive.google.com/uc?id=1UEr3hcVzzh98yftpKyam57R9dgvvgU3K",
-    "chest_xray_model.h5": "https://drive.google.com/uc?id=1SHzJ-7N_R7RsgHNDl0fzsTF1b84b8USN",
-    "Vgg16(2).h5": "https://drive.google.com/uc?id=17ipViFN87tRpHbPCMPERwcSdYhVFXFPi"
+    "chest_xray_model.tflite": "https://drive.google.com/uc?id=1c4L5_6vAGFqe66pKzs0lYQ9yKb2f6CeF",
+    "Vgg16(2).tflite": "https://drive.google.com/uc?id=1z-P0SBTACG_e1MHvkcHBrWaZM_Wlu5FQ"
 }
 
 # Minimum expected file size for models (in MB)
-MIN_MODEL_SIZE_MB = 10
+MIN_MODEL_SIZE_MB = 5
 
-# Mapping of model types to model files
+# Mapping of model types to model files and their types
 MODEL_FILES = {
-    'eye': 'Vgg16(2).h5',
-    'chest': 'chest_xray_model.h5',
-    'brain': 'Brain_tumor_best_model.h5'
+    'eye': {'file': 'Vgg16(2).tflite', 'type': 'tflite'},
+    'chest': {'file': 'chest_xray_model.tflite', 'type': 'tflite'},
+    'brain': {'file': 'Brain_tumor_best_model.h5', 'type': 'h5'}
 }
 
-# Validate if a file is a valid HDF5 file
-def is_valid_hdf5(file_path):
-    try:
-        with h5py.File(file_path, 'r') as f:
-            return True
-    except Exception as e:
-        logger.error(f"Invalid HDF5 file {file_path}: {str(e)}")
-        return False
+# Cache for loaded models
+MODEL_CACHE = {}
+
+# Function to log memory usage
+def log_memory_usage():
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    memory_mb = mem_info.rss / (1024 * 1024)  # Convert bytes to MB
+    logger.info(f"Current memory usage: {memory_mb:.2f} MB")
 
 # Check if Google Drive link is accessible
 def is_url_accessible(url):
@@ -57,19 +61,14 @@ def is_url_accessible(url):
         logger.error(f"Failed to access URL {url}: {str(e)}")
         return False
 
-# Download a model if it doesn’t exist locally or is invalid
+# Download a model if it doesn’t exist locally
 def download_model(model_name):
     model_path = os.path.join(MODEL_DIR, model_name)
-    # Check if file exists and is valid; if not, delete and re-download
     if os.path.exists(model_path):
-        if not is_valid_hdf5(model_path):
-            logger.info(f"Removing invalid file {model_name}")
+        file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
+        if file_size < MIN_MODEL_SIZE_MB:
+            logger.info(f"Removing small file {model_name} ({file_size:.2f} MB)")
             os.remove(model_path)
-        else:
-            file_size = os.path.getsize(model_path) / (1024 * 1024)  # Size in MB
-            if file_size < MIN_MODEL_SIZE_MB:
-                logger.info(f"Removing small file {model_name} ({file_size:.2f} MB)")
-                os.remove(model_path)
     
     if not os.path.exists(model_path):
         url = MODEL_URLS.get(model_name)
@@ -88,14 +87,35 @@ def download_model(model_name):
                 logger.error(f"Downloaded file {model_name} is too small ({file_size:.2f} MB)")
                 os.remove(model_path)
                 raise ValueError(f"Downloaded file {model_name} is too small")
-            if not is_valid_hdf5(model_path):
-                logger.error(f"Downloaded file {model_name} is not a valid HDF5 file")
-                os.remove(model_path)
-                raise ValueError(f"Downloaded file {model_name} is not a valid HDF5 file")
         except Exception as e:
             logger.error(f"Failed to download {model_name}: {str(e)}")
             raise
     return model_path
+
+# Load model based on type
+def load_model_for_type(model_type):
+    model_info = MODEL_FILES[model_type]
+    model_name = model_info['file']
+    model_path = download_model(model_name)
+
+    if model_type in MODEL_CACHE:
+        return MODEL_CACHE[model_type]
+
+    if model_info['type'] == 'h5':
+        logger.info(f"Loading .h5 model for {model_type} from {model_path}...")
+        model = load_model(model_path)
+        MODEL_CACHE[model_type] = {'type': 'h5', 'model': model}
+    else:  # tflite
+        logger.info(f"Loading .tflite model for {model_type} from {model_path}...")
+        interpreter = tflite.Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+        MODEL_CACHE[model_type] = {
+            'type': 'tflite',
+            'interpreter': interpreter,
+            'input_details': interpreter.get_input_details(),
+            'output_details': interpreter.get_output_details()
+        }
+    return MODEL_CACHE[model_type]
 
 labels = {
     'eye': ['Age-Related Macular Degeneration', 'Branch Retinal Vein Occlusion',
@@ -115,14 +135,19 @@ image_sizes = {
 @app.route('/', methods=['GET'])
 def health_check():
     """Simple health check endpoint."""
+    log_memory_usage()
     return jsonify({'status': 'OK', 'message': 'HealthSphere Backend is running', 'available_models': list(MODEL_FILES.keys())})
 
 def preprocess_image(image_path, model_type):
     """Loads and preprocesses image for model prediction."""
     try:
-        img = load_img(image_path, target_size=image_sizes[model_type])
+        img = load_img(image_path, target_size=image_sizes[model_type], color_mode='rgb')
         img = img_to_array(img)
         img = np.expand_dims(img, axis=0)
+        # Apply normalization only for eye and chest (.tflite models)
+        # Do NOT normalize for brain (.h5 model) as per original working code
+        if model_type in ['eye', 'chest']:
+            img = img / 255.0  # Normalize to [0, 1] for .tflite models
         return img
     except Exception as e:
         logger.error("Error preprocessing image for %s: %s", model_type, str(e))
@@ -130,6 +155,7 @@ def preprocess_image(image_path, model_type):
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    log_memory_usage()
     if 'image' not in request.files or 'model' not in request.form:
         return jsonify({'error': 'Missing image or model type'}), 400
     
@@ -148,17 +174,26 @@ def predict():
         return jsonify({'error': f'Failed to save image: {str(e)}'}), 500
 
     try:
-        # Download and load the model on-demand
-        model_name = MODEL_FILES[model_type]
-        model_path = download_model(model_name)
-        logger.info("Loading model %s for %s...", model_name, model_type)
-        model = load_model(model_path)
+        # Load the model (cached if already loaded)
+        model_data = load_model_for_type(model_type)
+        logger.info("Model loaded for %s", model_type)
 
-        # Preprocess image and predict
+        # Preprocess image
         img = preprocess_image(image_path, model_type)
-        prediction = model.predict(img)
-        logger.info("Raw prediction for %s: %s", model_type, prediction)
 
+        # Run inference based on model type
+        if model_data['type'] == 'h5':
+            model = model_data['model']
+            prediction = model.predict(img)
+        else:  # tflite
+            interpreter = model_data['interpreter']
+            input_details = model_data['input_details']
+            output_details = model_data['output_details']
+            interpreter.set_tensor(input_details[0]['index'], img)
+            interpreter.invoke()
+            prediction = interpreter.get_tensor(output_details[0]['index'])
+
+        logger.info("Raw prediction for %s: %s", model_type, prediction)
         predicted_index = np.argmax(prediction)
         predicted_label = labels[model_type][predicted_index]
 
@@ -166,10 +201,9 @@ def predict():
         os.remove(image_path)
         logger.info("Temporary image removed for %s", model_type)
 
-        # Free up memory
-        del model
+        # Free up memory (optional, since we cache models)
         gc.collect()
-        tf.keras.backend.clear_session()  # Clear TensorFlow session to free memory
+        log_memory_usage()
         
         return jsonify({'prediction': predicted_label})
     except Exception as e:
